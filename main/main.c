@@ -33,6 +33,8 @@
 #define MIN_BOTTOM 5
 #define MIN_LEFT 60
 
+#define SCREEN_OFF_SEC 30 // idle seconds lying flat before the screen turns off
+
 static const char *TAG = "pomodoro";
 static i2c_master_dev_handle_t s_imu;
 static lv_obj_t *s_phase;
@@ -56,6 +58,30 @@ static bool s_running;
 static bool s_finished;
 static lv_disp_rotation_t s_rotation = LV_DISPLAY_ROTATION_0;
 static esp_codec_dev_handle_t s_speaker;
+static bool s_screen_on = true;
+static int64_t s_last_activity_us;
+
+static void screen_set(bool on)
+{
+    if (on == s_screen_on) {
+        return;
+    }
+    // On the CO5300 AMOLED, brightness 0 turns every pixel off, so the panel draws almost nothing.
+    const esp_err_t err = on ? bsp_display_backlight_on() : bsp_display_backlight_off();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "screen %s failed: %s", on ? "on" : "off", esp_err_to_name(err));
+        return;
+    }
+    s_screen_on = on;
+    ESP_LOGI(TAG, "screen %s", on ? "on" : "off");
+}
+
+static void wake_cb(lv_event_t *e)
+{
+    (void)e;
+    s_last_activity_us = esp_timer_get_time();
+    screen_set(true);
+}
 
 static void speaker_init(void)
 {
@@ -256,6 +282,17 @@ static void update_ui(lv_timer_t *timer)
             s_rotation = LV_DISPLAY_ROTATION_0;
         }
     }
+    const int64_t now = esp_timer_get_time();
+    if (!idle) {
+        // Running, paused or finished: keep the screen on and restart the idle countdown.
+        s_last_activity_us = now;
+        screen_set(true);
+    } else if (s_screen_on && now - s_last_activity_us >= SCREEN_OFF_SEC * 1000000LL) {
+        screen_set(false);
+    }
+    if (!s_screen_on) {
+        return; // nothing to draw while the screen is off
+    }
     if (idle) {
         show_place_hint(true);
         lv_obj_add_flag(s_phase, LV_OBJ_FLAG_HIDDEN);
@@ -343,6 +380,7 @@ static void build_ui(void)
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x000000), LV_PART_MAIN);
     lv_obj_set_style_pad_all(screen, 0, LV_PART_MAIN);
     lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(screen, wake_cb, LV_EVENT_PRESSED, NULL); // tap the idle screen to wake it
 
     s_phase = lv_label_create(screen);
     lv_obj_set_style_text_font(s_phase, &lv_font_unscii_16, LV_PART_MAIN);
@@ -475,6 +513,8 @@ void app_main(void)
         return;
     }
     build_ui();
+    s_last_activity_us = esp_timer_get_time();
     lv_timer_create(update_ui, 250, NULL);
     bsp_display_unlock();
 }
+
