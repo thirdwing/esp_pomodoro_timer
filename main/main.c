@@ -154,6 +154,7 @@ static void play_done(void)
         return;
     }
     esp_codec_dev_set_out_vol(s_speaker, 90);
+    vTaskDelay(pdMS_TO_TICKS(150)); // let the amp settle so its turn-on click doesn't run into the chime
     play_note(1046.5f, 0.45f);
     play_note(784.0f, 0.80f);
     vTaskDelay(pdMS_TO_TICKS(100)); // let the I2S DMA drain before cutting the amp
