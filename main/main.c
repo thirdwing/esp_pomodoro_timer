@@ -6,6 +6,7 @@
 #include <stdlib.h>
 
 #include "bsp/esp-bsp.h"
+#include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/i2s_std.h"
 #include "esp_err.h"
@@ -83,13 +84,20 @@ static void wake_cb(lv_event_t *e)
     screen_set(true);
 }
 
+// Hold the power amplifier off so it can't pop while the rest of the board powers up.
+static void speaker_amp_off(void)
+{
+    gpio_config(&(gpio_config_t){.pin_bit_mask = 1ULL << BSP_POWER_AMP_IO, .mode = GPIO_MODE_OUTPUT});
+    gpio_set_level(BSP_POWER_AMP_IO, 0);
+}
+
+// Set up I2S and the ES8311 but leave the codec closed (amplifier off); play_done() opens it.
 static void speaker_init(void)
 {
     i2s_chan_handle_t tx = NULL;
-    i2s_chan_handle_t rx = NULL;
     i2s_chan_config_t channel = I2S_CHANNEL_DEFAULT_CONFIG(CONFIG_BSP_I2S_NUM, I2S_ROLE_MASTER);
     channel.auto_clear = true;
-    ESP_ERROR_CHECK(i2s_new_channel(&channel, &tx, &rx));
+    ESP_ERROR_CHECK(i2s_new_channel(&channel, &tx, NULL));
     const i2s_std_config_t i2s = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
         .slot_cfg = I2S_STD_PHILIP_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
@@ -98,9 +106,7 @@ static void speaker_init(void)
     };
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx, &i2s));
     ESP_ERROR_CHECK(i2s_channel_enable(tx));
-    ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx, &i2s));
-    ESP_ERROR_CHECK(i2s_channel_enable(rx));
-    audio_codec_i2s_cfg_t i2s_cfg = {.port = CONFIG_BSP_I2S_NUM, .tx_handle = tx, .rx_handle = rx};
+    audio_codec_i2s_cfg_t i2s_cfg = {.port = CONFIG_BSP_I2S_NUM, .tx_handle = tx};
     audio_codec_i2c_cfg_t i2c_cfg = {.port = BSP_I2C_NUM, .addr = ES8311_CODEC_DEFAULT_ADDR,
                                       .bus_handle = bsp_i2c_get_handle()};
     const audio_codec_if_t *codec = es8311_codec_new(&(es8311_codec_cfg_t){
@@ -109,9 +115,6 @@ static void speaker_init(void)
     });
     s_speaker = esp_codec_dev_new(&(esp_codec_dev_cfg_t){.dev_type = ESP_CODEC_DEV_TYPE_OUT,
         .codec_if = codec, .data_if = audio_codec_new_i2s_data(&i2s_cfg)});
-    esp_codec_dev_open(s_speaker, &(esp_codec_dev_sample_info_t){
-        .bits_per_sample = 16, .channel = 1, .sample_rate = SAMPLE_RATE, .mclk_multiple = 256});
-    esp_codec_dev_set_out_vol(s_speaker, 90);
 }
 
 static void play_note(float freq, float seconds)
@@ -143,8 +146,18 @@ static void play_note(float freq, float seconds)
 
 static void play_done(void)
 {
+    // Opening the codec powers the amplifier; it's only on for the chime.
+    if (esp_codec_dev_open(s_speaker, &(esp_codec_dev_sample_info_t){
+            .bits_per_sample = 16, .channel = 1, .sample_rate = SAMPLE_RATE, .mclk_multiple = 256})
+        != ESP_CODEC_DEV_OK) {
+        ESP_LOGW(TAG, "speaker open failed");
+        return;
+    }
+    esp_codec_dev_set_out_vol(s_speaker, 90);
     play_note(1046.5f, 0.45f);
     play_note(784.0f, 0.80f);
+    vTaskDelay(pdMS_TO_TICKS(100)); // let the I2S DMA drain before cutting the amp
+    esp_codec_dev_close(s_speaker);
 }
 
 static esp_err_t imu_write(uint8_t reg, uint8_t value)
@@ -499,6 +512,7 @@ static void release_v2_panel_reset(void)
 
 void app_main(void)
 {
+    speaker_amp_off();
     orientation_self_check();
     release_v2_panel_reset();
     if (!imu_init()) {
